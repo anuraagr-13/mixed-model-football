@@ -1,0 +1,432 @@
+---
+title: "STATS501 Project EDA"
+author: "Falak Shah, Shubham Pandey, Anuraag Ramesh"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+# loading libraries
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(ggpubr)
+```
+
+```{r}
+# loading data
+results = read.csv("results.csv")
+goalscorers = read.csv("goalscorers.csv")
+shootouts = read.csv("shootouts.csv")
+```
+
+```{r}
+#preprocessing
+
+df_raw <- read_csv("results.csv")
+
+# assign matchID
+
+matchID <- 1:nrow(df_raw)
+df_raw <- data.frame(matchID, df_raw) 
+
+df_join <- 
+ df_raw %>% 
+ select(home_team, away_team, matchID) %>% 
+ gather(key = type, value = key_team, -matchID)
+
+df_processed <- df_raw %>% mutate(year = year(date))
+
+df_augmented <- 
+  df_join %>% 
+  left_join(df_processed) %>% 
+  mutate(result = case_when(
+    type == "home_team" & home_score > away_score ~ "win",
+    type == "home_team" & home_score < away_score ~ "loss",
+    type == "away_team" & away_score > home_score ~ "win",
+    type == "away_team" & away_score < home_score ~ "loss",
+    home_score == away_score ~ "draw"
+  )) %>% 
+  mutate(
+    goals_for     = ifelse(type == "home_team", home_score, away_score),
+    goals_against = ifelse(type == "home_team", away_score, home_score)
+  ) %>% 
+  mutate(
+    tmp = 1
+  ) %>% 
+  spread(result, tmp, fill = 0)
+
+df_summarized <- 
+  df_augmented %>%
+  group_by(year, key_team) %>% 
+  summarize_at(vars(win, draw, loss, goals_for, goals_against), sum) 
+
+write_csv(df_summarized, str_c(today(), "_summarized-yearly-results.csv"))
+```
+
+
+```{r}
+df_summarized
+```
+
+# EDA
+
+## Why negative binomial
+```{r}
+# distribution of all-time goals scored here (neg binom)
+ggplot(data=df_augmented, aes(goals_for)) + 
+  geom_histogram(binwidth = 1, 
+                 col="blue", 
+                 fill="red", 
+                 alpha = .2) + 
+  labs(title="Goals Scored by Team in Single Match") +
+  labs(x="Number of Goals Scored in Match",y = "Count")
+
+ggsave("whynb.png")
+```
+
+```{r}
+mean(df_augmented$goals_for)
+var(df_augmented$goals_for)
+```
+
+# Goals scored in a year
+
+```{r}
+p1 <- 
+  ggplot(data=df_summarized, aes(goals_for)) + 
+    geom_histogram(binwidth = 1,
+                   col="blue", 
+                   fill="red", 
+                   alpha = .2) + 
+    labs(title="Goals Scored by Team in Single Year") +
+    labs(x="Number of Goals Scored in Year")
+ggsave("goals_scored_year.png", plot = p1)
+```
+
+
+# Goals conceded in a year
+
+```{r}
+p2 <-
+  ggplot(data=df_summarized, aes(goals_against)) + 
+    geom_histogram(binwidth = 1,
+                   col="blue", 
+                  fill="red", 
+                   alpha = .2) + 
+    labs(title="Goals Allowed by Team in Single Year") +
+    labs(x="Number of Goals Allowed in Year")
+ggsave("goals_conc_year.png", plot = p2)
+```
+
+# Distribution of games across tournaments
+
+```{r}
+tournament = results %>% group_by(tournament) %>% summarise(n = n()) %>% arrange(desc(n))
+
+p <- ggplot(tournament[c(1:10),], aes(x = reorder(tournament, n), y = n)) + geom_bar(stat = "identity",fill = "steelblue")
+p + coord_flip() + theme_minimal() + xlab("Tournament") + ylab("Number of Games") + ggtitle("Number of games across different types of tournaments")
+ggsave("tournaments.png")
+```
+
+# Number of games each year
+
+```{r}
+results$date = as.Date(results$date)
+results$year = format(as.Date(results$date, format="%Y/%m/%d"),"%Y")
+games = results %>% group_by(year) %>% summarise(n = n())
+
+# Change the color
+ggplot(data=games, aes(x=year, y=n)) +
+  geom_line(color="red")+
+  geom_point() + scale_x_discrete(breaks = seq(1872,2022,10)) + xlab("Year") +
+  ylab("Number of Games") + ggtitle("Number of games from 1872 to 2022")
+
+ggsave("number_of_games.png")
+
+```
+
+# Most attacking team
+
+```{r}
+df_summarized %>% group_by(key_team) %>% summarise(avg_scored = mean(goals_for)) %>% arrange(desc(avg_scored))
+```
+
+# Most defending team
+
+```{r}
+df_summarized %>% group_by(key_team) %>% summarise(avg_conc = mean(goals_against)) %>% arrange((avg_conc))
+```
+
+# Importance of Home vs Away
+
+```{r}
+df_summarized2 <- 
+  df_augmented %>%
+  group_by(year, key_team, type) %>% 
+  summarize_at(vars(win, draw, loss, goals_for, goals_against), sum) %>% 
+  mutate(total_matches = win + loss + draw) %>% 
+  filter(year > 1910)
+
+df_summarized2 = df_summarized2 %>% mutate(perc_win = (win/total_matches)*100,
+                                           perc_loss = (loss/total_matches)*100)
+
+df_summarized2 %>% arrange(desc(perc_win))
+
+ggplot(df_summarized2, aes(x=type, y=perc_win, fill=type)) + 
+    geom_boxplot() + xlab("Venue of Game") + ylab("Win Percentage") + ggtitle("Distribution of home vs away win percentage across years")
+
+ggsave("home_vs_away.png")
+
+df_summarized3 <- 
+  df_augmented %>%
+  group_by(year, type) %>% 
+  summarize_at(vars(win, draw, loss, goals_for, goals_against), sum) %>% 
+  mutate(total_matches = win + loss + draw) %>% 
+  filter(year > 1910)
+
+df_summ = df_summarized3 %>% mutate(win_perc = (win/total_matches)*100)
+df_summ
+
+ggplot(df_summ,aes(x= year, y= win_perc, group=type, color=type)) +
+    geom_line() + xlab("Year") +
+  ylab("Win Percentage") + ggtitle("Home vs Away win percentage across years")
+
+ggsave("home_vs_away2.png")
+```
+
+# Importance of oppostion strenghts
+
+# Most successful home teams
+
+```{r}
+df_summarized2$combined =  str_c(df_summarized2$key_team," ",df_summarized2$year)
+
+home_df = df_summarized2 %>% filter(type == "home_team",total_matches >= 10) %>% arrange(desc(perc_win))
+away_df = df_summarized2 %>% filter(type == "away_team",total_matches >= 10) %>% arrange(desc(perc_win))
+home_df = home_df[1:10,]
+away_df = away_df[1:10,]
+
+# Most successful home teams
+ggdotchart(home_df, x = "combined", y = "perc_win", # Custom color palette
+           sorting = "descending",                       # Sort value in descending order
+           add = "segments",
+           color = "red",# Add segments from y = 0 to dots
+           rotate = TRUE,
+           palette = c("#00AFBB"),# Rotate vertically
+                                           # Order by groups
+           dot.size = 6,                                 # Large dot size
+           label = round(home_df$perc_win),                        # Add mpg values as dot labels
+           font.label = list(color = "white", size = 9, 
+                             vjust = 0.5),               # Adjust label parameters
+           ggtheme = theme_pubr(),
+           xlab = "Country and Year",
+           ylab = "Win Percentage",
+           title = "10 Most Successful Home Teams"# ggplot2 theme
+           )
+
+ggsave("home_success.png")
+
+```
+
+# Least successful home teams
+
+```{r}
+# Least successful home teams
+home_df = df_summarized2 %>% filter(type == "home_team",total_matches >= 10) %>% arrange(desc(perc_win))
+home_df2 = tail(home_df,10)
+
+ggdotchart(home_df2, x = "combined", y = "perc_win", # Custom color palette
+           sorting = "descending",                       # Sort value in descending order
+           add = "segments",
+           color = "blue",# Add segments from y = 0 to dots
+           rotate = TRUE,
+           palette = c("#00AFBB"),# Rotate vertically
+                                           # Order by groups
+           dot.size = 6,                                 # Large dot size
+           label = round(home_df2$perc_win),                        # Add mpg values as dot labels
+           font.label = list(color = "white", size = 9, 
+                             vjust = 0.5),               # Adjust label parameters
+           ggtheme = theme_pubr(),
+           xlab = "Country and Year",
+           ylab = "Win Percentage",
+           title = "10 Least Successful Home Teams"# ggplot2 theme
+           )
+
+ggsave("home_fail.png")
+```
+
+# Most successful away teams
+
+```{r}
+# Most successful away teams
+away_df = df_summarized2 %>% filter(type == "away_team",total_matches >= 10) %>% arrange(desc(perc_win))
+away_df2 = head(away_df,10)
+
+ggdotchart(away_df2, x = "combined", y = "perc_win", # Custom color palette
+           sorting = "descending",                       # Sort value in descending order
+           add = "segments",
+           color = "dark green",# Add segments from y = 0 to dots
+           rotate = TRUE,
+           palette = c("#00AFBB"),# Rotate vertically
+                                           # Order by groups
+           dot.size = 6,                                 # Large dot size
+           label = round(away_df2$perc_win),                        # Add mpg values as dot labels
+           font.label = list(color = "white", size = 9, 
+                             vjust = 0.5),               # Adjust label parameters
+           ggtheme = theme_pubr(),
+           xlab = "Country and Year",
+           ylab = "Win Percentage",
+           title = "10 Most Successful Away Teams"# ggplot2 theme
+           )
+ggsave("away_success.png")
+```
+
+```{r}
+results %>% filter(year >= 2000)
+```
+
+# Team strength metric according to generalized mixed effect model
+
+```{r}
+model = read.csv("quality_team.csv")
+model = model[,c(1:4)]
+model %>% arrange(desc(quality.metric))
+```
+
+
+```{r}
+tc = c("Brazil","Spain","Argentina","France","England","Netherlands","Portugal","Germany","Colombia","Uruguay")
+model_long = model %>% 
+  pivot_longer(cols=c('attack', 'defense','quality.metric'),
+                    names_to='type',
+                    values_to='score')
+
+test_model = model_long %>% filter(country %in% tc)
+
+test_model$country <- factor(test_model$country, levels = c("Brazil","Spain","Argentina","France","England","Netherlands","Portugal","Germany","Colombia","Uruguay"))
+test_model
+```
+
+
+```{r}
+# Grouped
+ggplot(test_model, aes(fill=type, y=score, x=country)) + 
+    geom_bar(position="dodge", stat="identity") + coord_flip() + ylab("Overall Quality") + xlab("Country") +
+  ggtitle("Ten countries with the highest quality (In increasing order)") +
+  scale_fill_manual(values=c('Dark Green', 'Red', 'Light Blue'))
+
+ggsave("model_plot.png")
+```
+
+# Yearly Team strength metric according to generalized mixed effect model
+
+```{r}
+plot_df = read.csv("quality_teamyear.csv")
+plot_df = plot_df %>% mutate(overall_quality = overall_attack - overall_defence) %>% select(year,country,year_quality,overall_quality) %>% arrange(desc(year_quality))
+
+test_df =  plot_df %>% group_by(country) %>% summarise(overall_quality)
+distinct_df = distinct(test_df)
+
+plot_df = plot_df %>% group_by(country) %>% summarise(max_qual = max(year_quality),min_qual = min(year_quality))
+distinct_df
+plot_df$overall = distinct_df$overall_quality
+plot_df
+
+plot_longer = plot_df %>% 
+  pivot_longer(cols=c('max_qual', 'min_qual','overall'),
+                    names_to='type',
+                    values_to='score')
+plot_longer
+
+tp = c("Germany","Portugal","Netherlands")
+plot_longer = plot_longer %>% filter(country %in% tp)
+plot_longer
+plot_longer$year = c("2010","2003","","2015","2002","","2022","2008","")
+plot_longer
+
+df <- plot_longer %>% mutate(
+  country_year = paste(country,year, sep = " ")
+)
+df = df[,c(2:5)]
+
+df = df[,c(4,1,2)]
+
+# Grouped
+ggplot(df, aes(fill=type, y=score, x=country_year)) + 
+    geom_bar(position="dodge", stat="identity",width = 0.3) + coord_flip() + ylab("Overall Quality") + xlab("Country") +
+  ggtitle("Country quality across years") +
+  scale_fill_manual(values=c('Dark Green', 'Red', 'Light Blue'))
+
+ggsave("model_plot2.png")
+
+```
+
+# Team strength metric according to bayesian mixed effect model
+
+```{r}
+quality_team = read.csv('quality_team_b.csv')
+tc = c("Brazil","Spain","Argentina","France","England","Netherlands","Portugal","Germany","Colombia","Uruguay")
+model_long = quality_team %>% 
+  pivot_longer(cols=c('attack', 'defense','quality_metric'),
+                    names_to='type',
+                    values_to='score')
+
+test_model = model_long %>% filter(country %in% tc)
+
+test_model$country <- factor(test_model$country, levels = c("Brazil","England","Netherlands","Argentina","Spain","France","Germany","Portugal","Uruguay","Colombia"))
+test_model %>% arrange(desc(score))
+
+# Grouped
+ggplot(test_model, aes(fill=type, y=score, x=country)) + 
+    geom_bar(position="dodge", stat="identity") + coord_flip() + ylab("Overall Quality") + xlab("Country") +
+  ggtitle("Ten countries with the highest quality (In increasing order)") +
+  scale_fill_manual(values=c('Dark Green', 'Red', 'Light Blue'))
+
+ggsave("bayes_plot1.png")
+```
+
+# Yearly Team strength metric according to bayesian mixed effect model
+
+```{r}
+quality_team_year = read.csv("quality_teamyear_b.csv")
+
+plot_df = quality_team_year %>% mutate(overall_quality = overall_attack - overall_defence) %>% select(year,country,year_quality,overall_quality) %>% arrange(desc(year_quality))
+
+test_df =  plot_df %>% group_by(country) %>% summarise(overall_quality)
+distinct_df = distinct(test_df)
+
+plot_df = plot_df %>% group_by(country) %>% summarise(max_qual = max(year_quality),min_qual = min(year_quality))
+distinct_df
+plot_df$overall = distinct_df$overall_quality
+plot_df
+
+plot_longer = plot_df %>% 
+  pivot_longer(cols=c('max_qual', 'min_qual','overall'),
+                    names_to='type',
+                    values_to='score')
+plot_longer
+
+tp = c("Germany","Portugal","Netherlands")
+plot_longer = plot_longer %>% filter(country %in% tp)
+plot_longer
+plot_longer$year = c("2010","2003","","2015","2002","","2022","2008","")
+plot_longer
+
+df <- plot_longer %>% mutate(
+  country_year = paste(country,year, sep = " ")
+)
+df = df[,c(2:5)]
+
+df = df[,c(4,1,2)]
+
+# Grouped
+ggplot(df, aes(fill=type, y=score, x=country_year)) + 
+    geom_bar(position="dodge", stat="identity",width = 0.3) + coord_flip() + ylab("Overall Quality") + xlab("Country") +
+  ggtitle("Country quality across years") +
+  scale_fill_manual(values=c('Dark Green', 'Red', 'Light Blue'))
+
+ggsave("bayes_plot2.png")
+
+```
+
