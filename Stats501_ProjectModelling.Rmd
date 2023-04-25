@@ -1,0 +1,389 @@
+---
+title: "STATS501 Project Modelling"
+author: "Anuraag Ramesh, Falak Shah, Shubham Pandey"
+date: "Apr 23, 2023"
+output:
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo =TRUE, comment=NA, out_width=100, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(lubridate)
+library(lme4)
+library(brms)
+library(rstanarm)
+library(rstan)
+```
+
+Initial Data Processing using results.csv (Match results from 1872 to present)
+
+```{r}
+#Initial data
+df_initial <- read_csv("results.csv")
+#We assign a match ID to make each record unique
+matchID <- 1:nrow(df_initial)
+df_initial <- data.frame(matchID, df_initial)
+
+#Add a Year column
+df_year <- 
+  df_initial %>% 
+  mutate(year = year(date))
+```
+
+```{r}
+#Top Goalscorers for a country in a year
+goal_scorers = read_csv('goalscorers.csv')
+goal_scorers$year = year(goal_scorers$date)
+
+temp = goal_scorers %>% group_by(year, team, scorer) %>% count() 
+new = temp %>% group_by(year, team) %>% filter(n == max(n)) %>% filter(row_number()==1)
+head(new %>% arrange(desc(n)), 20)
+```
+
+Harry Kane in 2021 scored 16 goals for England, which implies an amazing year for the country.    
+
+```{r}
+# Subset the dataset to required columns
+df_sub <- 
+  df_initial %>% 
+  select(home_team, away_team, matchID) %>% 
+  gather(key = type, value = key_team, -matchID)
+
+# We add a home_team and away_team score in the dataset using one-hot encoding
+df_unique <- 
+  df_sub %>% 
+  left_join(df_year) %>% 
+  mutate(result = case_when(
+    type == "home_team" & home_score > away_score ~ "win",
+    type == "home_team" & home_score < away_score ~ "loss",
+    type == "away_team" & away_score > home_score ~ "win",
+    type == "away_team" & away_score < home_score ~ "loss",
+    home_score == away_score ~ "draw")) %>% 
+  mutate(
+    goals_for     = ifelse(type == "home_team", home_score, away_score),
+    goals_against = ifelse(type == "home_team", away_score, home_score)) %>% 
+  mutate(
+    tmp = 1) %>% spread(result, tmp, fill = 0)
+```
+
+
+```{r}
+# We consider data after 1910s, because there wasn't a lot of countries 
+# playing football before this
+df_homeaway <- 
+  df_unique %>%
+  group_by(year, key_team, type) %>% 
+  summarize_at(vars(win, draw, loss, goals_for, goals_against), sum) %>% 
+  mutate(total_matches = win + loss + draw) %>% 
+  filter(year > 1910)
+
+# We add a win percentage column
+df_homeaway = df_homeaway %>% mutate(win_perc = win/total_matches)
+
+#Preparing the dataset for the mixed model
+df_mixed <- 
+  df_unique %>%
+  group_by(year, key_team) %>% 
+  summarize_at(vars(win, draw, loss, goals_for, goals_against), sum) %>% 
+  mutate(total_matches = win + loss + draw) %>% 
+  filter(year > 1910)
+
+df_mixed = df_mixed %>% mutate(win_perc = win/total_matches)
+```
+
+
+```{r}
+# Reducing to only required variables to create the model
+df_mixed1 <- 
+  df_unique %>% 
+  mutate(
+    team = ifelse(type == "home_team", home_team, away_team),
+    goals = ifelse(type == "home_team", home_score, away_score),
+    opponent = ifelse(type == "home_team", away_team, home_team),
+    type = ifelse(neutral == TRUE, "neutral", type)
+  ) %>% 
+  select(year, team, goals, opponent, type, date) %>% 
+  filter(year > 1910)
+
+# Select and change the name of variables to make sense
+df_final = df_mixed1 %>% left_join(df_mixed,by=c('year'='year', 
+                                    'opponent'='key_team')) %>%
+  select(year, date, team, goals, opponent, type, opp_win = win_perc)
+```
+
+
+```{r}
+# We can filter to all matches after 1970s to reduce running time for the model 
+#and remove the test set(which is the 2022 world cup)
+df_finalsub = df_final %>% filter(year >= 1970 & year < 2023)
+df_finalsub = df_finalsub %>% filter(date < as.Date('2022-11-01'))
+nrow(df_finalsub)
+```
+
+We have 36733 different matches across the past 50 years from the 1970s for training the model.
+
+### Mixed Models
+
+After pre-processing the data, we create a mixed effects model using team, opponent, team per year and opponent per year as random effects, with opponent win percentage as the fixed effect.  
+
+```{r}
+# First mixed model
+#Takes 14 hours to run 
+mixed_model <- glmer.nb(goals ~ opp_win + (1 | team/year) + (1| opponent/year) + 
+                    (1 | type), df_finalsub)
+
+saveRDS(mixed_model, 'mixed_model1.RDS')
+```
+
+```{r}
+#Import the RDS file if model not run
+mixed_model = read_rds('mixed_model.RDS')
+
+mixed_model_out <- predict(mixed_model, type = "response")
+
+#Plot for predicted vs actual
+plot(mixed_model_out, df_finalsub$goals,
+     main='Predicted Goals vs Actual Goals scored',
+     xlab='Predicted', ylab='Actual')
+
+# Plot a regression line
+abline(lm(df_finalsub$goals ~ mixed_model_out), col = 2, lwd = 3)
+```
+
+```{r}
+# Residual plots for mixed model
+plot(mixed_model_out, residuals(mixed_model),
+     main='Residuals vs Fitted',
+     xlab='Fitted', ylab='Residuals')
+```
+
+```{r}
+#Quality metrics plot functions
+
+quality_plot <- function(model_coef){
+  a = data.frame(model_coef$opponent)
+  b = data.frame(model_coef$team)
+  a$country = rownames(a)
+  b$country = rownames(b)
+  new = a %>% left_join(b, by = 'country') %>%
+    select(country, attack = X.Intercept..y, defense = X.Intercept..x)
+  new = new %>% mutate('quality_metric' = attack - defense)
+  print(head(new), 10)
+  return(new)
+}
+
+quality_plotyear <- function(model_coef){
+  a = data.frame(model_coef$opponent)
+  b = data.frame(model_coef$team)
+  c = data.frame(model_coef$`year:opponent`)
+  d = data.frame(model_coef$`year:team`)
+  a$country = rownames(a)
+  b$country = rownames(b)
+  c$val = rownames(c)
+  d$val = rownames(d)
+  c = c %>% separate(val, c('year', 'country'), sep = ':')
+  d = d %>% separate(val, c('year', 'country'), sep = ':')
+  new1 = c %>% left_join(d, by = c('year', 'country')) %>%
+    left_join(a, by = 'country') %>% left_join(b, by = 'country') %>%
+    select(year, country, year_defence = X.Intercept..x, year_attack = X.Intercept..y, 
+           overall_attack = X.Intercept..y.y,
+           overall_defence = X.Intercept..x.x)
+
+  new1 = new1 %>% mutate(year_quality = (overall_attack + year_attack) - (overall_defence + year_defence))
+  
+  new1 %>% arrange(desc(year_quality))
+  print(head(new1), 10)
+  return(new1)
+}
+```
+
+```{r}
+#Create for the frequentist mixed model
+mixed_model_coef <- coef(mixed_model)
+q1 = quality_plot(mixed_model_coef)
+write_csv(q1, 'quality_team.csv')
+q2 = quality_plotyear(mixed_model_coef)
+write_csv(q2, 'quality_teamyear.csv')
+```
+
+```{r}
+#Creating the test dataset for the world cup to test our models
+df_test = df_final %>% filter(date >= as.Date('2022-11-20') & (date < as.Date('2022-12-19')))
+df_test = df_test %>% select(-goals)
+```
+
+### Bayesian Mixed Models
+
+Now, let us move on to the bayesian methods, we use the `stanarm` package. 
+
+```{r}
+#We create a beta prior to test
+prior = prior("beta", 1, 1)
+
+# We just use a vague flat prior instead for our model with 4 chains
+bayesian_mixed = stan_glmer.nb(goals ~ opp_win + (1 | team/year) + (1| opponent/year) + (1 | type), 
+              data = df_finalsub, cores = 4, chains = 4, iter = 1000)
+
+saveRDS(bayesian_mixed, 'bayesian_model.RDS')
+```
+
+```{r}
+#Import the RDS file if model not run
+bayesian_mixed = read_rds('bayesian_model.RDS')
+
+bayesian_coef = coef(bayesian_mixed)
+
+#MCMC diagnostics
+
+#First we check the R hat values and see if they are lesser than 1.1
+any(summary(bayesian_mixed)[, "Rhat"] > 1.1)
+
+#Then we check if the effective sample size (ESS) is lower than 1 in a lot of cases
+hist(summary(bayesian_mixed)[, "n_eff"] / 1000)
+```
+
+The model seems to have converged based on Rhat and ESS.
+
+```{r}
+#Bayesian plots to compare
+#Create for the bayesian mixed model
+q3 = quality_plot(bayesian_coef)
+write_csv(q3, 'quality_team_b.csv')
+q4 = quality_plotyear(bayesian_coef)
+write_csv(q4, 'quality_teamyear_b.csv')
+```
+
+
+### Testing phase for the world cup
+
+```{r}
+#Prediction for frequentist mixed method
+df_test1 = copy(df_test)
+df_test1 = df_test1 %>% filter(!team %in% c('Taiwan', 'Russia') & 
+                      !opponent %in% c('Taiwan', 'Russia'))
+mixed_goals_p = predict(mixed_model, df_test1)
+
+df_test1$goals = mixed_goals_p
+```
+
+```{r}
+#Interpretation
+val = nrow(df_test1)/2
+temp = df_test1 %>% slice(1:val)
+temp1 = df_test1 %>% slice(val + 1:nrow(df_test1)) %>% select(goals2 = goals)
+match_pred = cbind(temp, temp1)
+
+#Only considering matches in the World Cup
+match_pred = match_pred %>% filter(type == 'neutral' | team == 'Qatar' | opponent == 'Qatar') %>% slice(5: nrow(match_pred))
+```
+
+```{r}
+#Only considering Group Stage games for fair comparison
+match_pred = match_pred %>% slice(1:48)
+
+final_winner = match_pred %>% 
+    mutate(
+      team_winner = case_when(
+    goals > goals2  ~ team,
+    goals < goals2  ~ opponent,
+    goals == goals2  ~ "draw")
+    )
+
+#Predicting the teams to qualify
+final_winner %>% group_by(team_winner) %>% count() %>% arrange(desc(n))
+```
+Frequentist model predictions. 
+
+Actual: Netherlands, Senegal, England, United States, Argentina, Poland, France, Australia, Japan, Spain, Morocco, Croatia, Brazil, Switzerland, South Korea, Portugal
+
+Predicted: Netherlands, Ecuador, England, Iran, Argentina, Poland, France, Denmark, Belgium, Croatia, Spain, Germany, Brazil, Serbia, Portugal, Uruguay
+
+Frequentist Mixed Effects Model : 9/16  = 56.25%
+
+```{r}
+#Prediction for bayesian mixed method
+bayes_goals_p = posterior_predict(bayesian_mixed, df_test, 2000)
+df_test2 = copy(df_test)
+goals_b = round(colMeans(bayes_goals_p))
+df_test2$goals = goals_b
+```
+
+```{r}
+#Interpretation
+val = nrow(df_test2)/2
+temp = df_test2 %>% slice(1:val)
+temp1 = df_test2 %>% slice(val + 1:nrow(df_test1)) %>% select(goals2 = goals)
+match_pred = cbind(temp, temp1)
+
+match_pred = match_pred %>% filter(type == 'neutral' | team == 'Qatar' | opponent == 'Qatar') %>% slice(5: nrow(match_pred))
+
+#Only considering Group Stage games for fair comparison
+match_pred = match_pred %>% slice(1:48)
+
+val = nrow(df_test2)/2
+temp = df_test2 %>% slice(1:val) %>% select(goals2 = goals)
+temp1 = df_test2 %>% slice(val + 1:nrow(df_test1)) 
+match_pred1 = cbind(temp1, temp)
+
+match_pred1 = match_pred1 %>% filter(type == 'neutral' | team == 'Qatar' | opponent == 'Qatar') %>% slice(5: nrow(match_pred1))
+
+#Only considering Group Stage games for fair comparison
+match_pred1 = match_pred1 %>% slice(1:48)
+
+match_pred3 = rbind(match_pred, match_pred1)
+```
+
+```{r}
+#Predicting the teams to qualify
+final_winner = match_pred3 %>% 
+  mutate(value = case_when(
+    goals > goals2 ~ "win",
+    goals < goals2 ~ "loss",
+    goals == goals2 ~ "draw")) %>%
+  mutate(
+    tmp = 1) %>% spread(value, tmp, fill = 0)
+
+#Finding the top teams
+final_winner1 = final_winner %>% 
+  group_by(team) %>% 
+  summarize_at(vars(win, draw, loss), sum) %>%
+  mutate(points = (win * 3 + draw)) %>%
+  arrange(desc(points))
+```
+
+```{r}
+#All 8 groups predicted tables
+group1 = final_winner1 %>% filter(team %in% c('Netherlands', 'Senegal', 'Ecuador', 'Qatar'))
+print(group1)
+
+group2 = final_winner1 %>% filter(team %in% c('England', 'United States', 'Iran', 'Wales'))
+print(group2)
+
+group3 = final_winner1 %>% filter(team %in% c('Argentina' , 'Poland', 'Mexico', 'Saudi Arabia'))
+print(group3)
+
+group4 = final_winner1 %>% filter(team %in% c('France', 'Denmark', 'Australia', 'Tunisia'))
+print(group4)
+
+group5 = final_winner1 %>% filter(team %in% c('Japan', 'Spain', 'Germany', 'Costa Rica'))
+print(group5)
+
+group6 = final_winner1 %>% filter(team %in% c('Morocco', 'Croatia', 'Belgium', 'Canada'))
+print(group6)
+
+group7 = final_winner1 %>% filter(team %in% c('Brazil', 'Switzerland', 'Serbia', 'Cameroon'))
+print(group7)
+
+group8 = final_winner1 %>% filter(team %in% c('South Korea', 'Portugal', 'Ghana', 'Uruguay'))
+print(group8)
+```
+
+Bayesian model predictions
+
+Actual: Netherlands, Senegal, England, United States, Argentina, Poland, France, Australia, Japan, Spain, Morocco, Croatia, Brazil, Switzerland, South Korea, Portugal
+
+Predicted: Netherlands, Senegal, England, United States, Argentina, Poland, France, Australia, Spain, Germany, Croatia, Belgium,  Brazil, Serbia, Portugal, Uruguay
+
+Bayesian Mixed Effects Model : 12/16  = 75%
